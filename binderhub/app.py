@@ -1,6 +1,7 @@
 """
 The binderhub application
 """
+
 import asyncio
 import ipaddress
 import json
@@ -41,20 +42,21 @@ from traitlets import (
 )
 from traitlets.config import Application
 
-from .base import AboutHandler, Custom404, VersionHandler
+from .base import VersionHandler
 from .build import BuildExecutor, KubernetesBuildExecutor, KubernetesCleaner
 from .builder import BuildHandler
-from .config import ConfigHandler
 from .events import EventLog
+from .handlers.repoproviders import RepoProvidersHandlers
 from .health import HealthHandler, KubernetesHealthHandler
 from .launcher import Launcher
 from .log import log_request
-from .main import LegacyRedirectHandler, MainHandler, ParameterizedMainHandler
+from .main import LegacyRedirectHandler, RepoLaunchUIHandler, UIHandler
 from .metrics import MetricsHandler
 from .quota import KubernetesLaunchQuota, LaunchQuota
 from .ratelimit import RateLimiter
 from .registry import DockerRegistry
 from .repoproviders import (
+    CKANProvider,
     DataverseProvider,
     FigshareProvider,
     GistRepoProvider,
@@ -105,6 +107,11 @@ class BinderHub(Application):
         None,
         allow_none=True,
         help="""
+        ..removed::
+
+        No longer supported. If you want to use Google Analytics, use :attr:`extra_footer_scripts`
+        to load JS from Google Analytics.
+
         The Google Analytics code to use on the main page.
 
         Note that we'll respect Do Not Track settings, despite the fact that GA does not.
@@ -116,6 +123,11 @@ class BinderHub(Application):
     google_analytics_domain = Unicode(
         "auto",
         help="""
+        ..removed::
+
+        No longer supported. If you want to use Google Analytics, use :attr:`extra_footer_scripts`
+        to load JS from Google Analytics.
+
         The Google Analytics domain to use on the main page.
 
         By default this is set to 'auto', which sets it up for current domain and all
@@ -123,6 +135,13 @@ class BinderHub(Application):
         """,
         config=True,
     )
+
+    @observe("google_analytics_domain", "google_analytics_code")
+    def _google_analytics_deprecation(self, change):
+        if change.new:
+            raise ValueError(
+                f"Setting {change.owner.__class__.__name__}.{change.name} is no longer supported. Use {change.owner.__class__.__name__}.extra_footer_scripts to load Google Analytics JS directly"
+            )
 
     about_message = Unicode(
         "",
@@ -143,6 +162,14 @@ class BinderHub(Application):
         The value will be inserted "as is" into a HTML <div> element
         with grey background, located at the top of the BinderHub pages. Raw
         HTML is supported.
+        """,
+        config=True,
+    )
+
+    default_opengraph_title = Unicode(
+        "The Binder Project",
+        help="""
+        The default opengraph title for pages that don't have a generated opengraph title.
         """,
         config=True,
     )
@@ -556,7 +583,7 @@ class BinderHub(Application):
         return os.environ.get("BUILD_NAMESPACE", "default")
 
     build_image = Unicode(
-        "quay.io/jupyterhub/repo2docker:2023.06.0",
+        "quay.io/jupyterhub/repo2docker:2024.07.0",
         help="""
         DEPRECATED: Use c.KubernetesBuildExecutor.build_image
 
@@ -585,6 +612,7 @@ class BinderHub(Application):
             "figshare": FigshareProvider,
             "hydroshare": HydroshareProvider,
             "dataverse": DataverseProvider,
+            "ckan": CKANProvider,
         },
         config=True,
         help="""
@@ -733,19 +761,6 @@ class BinderHub(Application):
 
         return networks
 
-    ban_networks_min_prefix_len = Integer(
-        1,
-        help="The shortest prefix in ban_networks",
-    )
-
-    @observe("ban_networks")
-    def _update_prefix_len(self, change):
-        if not change.new:
-            min_len = 1
-        else:
-            min_len = min(net.prefixlen for net in change.new)
-        self.ban_networks_min_prefix_len = min_len or 1
-
     tornado_settings = Dict(
         config=True,
         help="""
@@ -795,7 +810,6 @@ class BinderHub(Application):
             - /versions
             - /build/([^/]+)/(.+)
             - /health
-            - /_config
             - /* -> shows a 404 page
         """,
         config=True,
@@ -865,9 +879,9 @@ class BinderHub(Application):
                 kubernetes.config.load_incluster_config()
             except kubernetes.config.ConfigException:
                 kubernetes.config.load_kube_config()
-            self.tornado_settings[
-                "kubernetes_client"
-            ] = self.kube_client = kubernetes.client.CoreV1Api()
+            self.tornado_settings["kubernetes_client"] = self.kube_client = (
+                kubernetes.client.CoreV1Api()
+            )
 
         # times 2 for log + build threads
         self.build_pool = ThreadPoolExecutor(self.concurrent_build_limit * 2)
@@ -923,9 +937,9 @@ class BinderHub(Application):
                 "log_function": log_request,
                 "image_prefix": self.image_prefix,
                 "debug": self.debug,
+                "default_opengraph_title": self.default_opengraph_title,
                 "launcher": self.launcher,
                 "ban_networks": self.ban_networks,
-                "ban_networks_min_prefix_len": self.ban_networks_min_prefix_len,
                 "build_pool": self.build_pool,
                 "build_token_check_origin": self.build_token_check_origin,
                 "build_token_secret": self.build_token_secret,
@@ -942,8 +956,6 @@ class BinderHub(Application):
                 "registry": registry,
                 "traitlets_config": self.config,
                 "traitlets_parent": self,
-                "google_analytics_code": self.google_analytics_code,
-                "google_analytics_domain": self.google_analytics_domain,
                 "about_message": self.about_message,
                 "banner_message": self.banner_message,
                 "extra_footer_scripts": self.extra_footer_scripts,
@@ -961,8 +973,7 @@ class BinderHub(Application):
                 "enable_api_only_mode": self.enable_api_only_mode,
             }
         )
-        if self.auth_enabled:
-            self.tornado_settings["cookie_secret"] = os.urandom(32)
+        self.tornado_settings["cookie_secret"] = secrets.token_bytes(32)
         if self.cors_allow_origin:
             self.tornado_settings.setdefault("headers", {})[
                 "Access-Control-Allow-Origin"
@@ -973,15 +984,23 @@ class BinderHub(Application):
             (r"/versions", VersionHandler),
             (r"/build/([^/]+)/(.+)", BuildHandler),
             (r"/health", self.health_handler_class, {"hub_url": self.hub_url_local}),
-            (r"/_config", ConfigHandler),
+            (r"/api/repoproviders", RepoProvidersHandlers),
         ]
         if not self.enable_api_only_mode:
             # In API only mode the endpoints in the list below
-            # are unregistered as they don't make sense in a API only scenario
+            # are not registered since they are primarily about providing UI
+
+            for provider_id in self.repo_providers:
+                # Register launchable URLs for all our repo providers
+                # These render social previews, but otherwise redirect to UIHandler
+                handlers += [
+                    (
+                        rf"/v2/({provider_id})/(.+)",
+                        RepoLaunchUIHandler,
+                        {"repo_provider": self.repo_providers[provider_id]},
+                    )
+                ]
             handlers += [
-                (r"/about", AboutHandler),
-                (r"/v2/([^/]+)/(.+)", ParameterizedMainHandler),
-                (r"/", MainHandler),
                 (r"/repo/([^/]+)/([^/]+)(/.*)?", LegacyRedirectHandler),
                 # for backward-compatible mybinder.org badge URLs
                 # /assets/images/badge.svg
@@ -1048,9 +1067,8 @@ class BinderHub(Application):
                         )
                     },
                 ),
+                (r"/.*", UIHandler),
             ]
-        # This needs to be the last handler in the list, because it needs to match "everything else"
-        handlers.append((r".*", Custom404))
         handlers = self.add_url_prefix(self.base_url, handlers)
         if self.extra_static_path:
             handlers.insert(

@@ -57,7 +57,7 @@ jobs:
         k3s-channel:
           # Available channels: https://github.com/k3s-io/k3s/blob/HEAD/channel.yaml
           # Don't use "latest", instead bump it using a PR so we know when a new version breaks BinderHub
-          - v1.28
+          - v1.30
         test:
           - main
           - auth
@@ -69,7 +69,7 @@ jobs:
           # which isn't documented anywhere, but is currently at 3.5.0. We also
           # test with the latest k8s and helm versions.
           #
-          - k3s-channel: v1.23
+          - k3s-channel: v1.28
             helm-version: v3.5.0
             test: helm
             test-variation: dind
@@ -77,14 +77,14 @@ jobs:
               --values testing/k8s-binder-k8s-hub/binderhub-chart+dind.yaml
               --set config.BinderHub.image_prefix=$REGISTRY_HOST/test/
               --set registry.url=http://$REGISTRY_HOST
-          - k3s-channel: v1.28
+          - k3s-channel: v1.29
             test: helm
             test-variation: pink
             local-chart-extra-args: >-
               --values testing/k8s-binder-k8s-hub/binderhub-chart+pink.yaml
               --set config.BinderHub.image_prefix=$REGISTRY_HOST/test/
               --set registry.url=http://$REGISTRY_HOST
-          - k3s-channel: v1.28
+          - k3s-channel: v1.29
             test: helm
             test-variation: upgrade
             # upgrade-from represents a release channel, see: https://jupyterhub.github.io/helm-chart/info.json
@@ -119,7 +119,7 @@ jobs:
                 - "http://$REGISTRY_HOST"
           EOF
 
-      - uses: jupyterhub/action-k3s-helm@v3
+      - uses: jupyterhub/action-k3s-helm@v4
         with:
           k3s-channel: ${{ matrix.k3s-channel }}
           helm-version: ${{ matrix.helm-version }}
@@ -136,13 +136,13 @@ jobs:
             libcurl4-openssl-dev \
             libssl-dev
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         id: setup-node
         with:
-          node-version: "18"
+          node-version: "22"
 
       - name: Cache npm
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.npm
           key: node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('**/package.json') }}-${{ github.job }}
@@ -152,13 +152,13 @@ jobs:
           npm install
           npm run webpack
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         id: setup-python
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Cache pip
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: python-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/*requirements.txt') }}-${{ github.job }}
@@ -170,8 +170,11 @@ jobs:
 
       - name: Setup Python package dependencies
         run: |
-          pip install -r dev-requirements.txt -r helm-chart/images/binderhub/requirements.txt
+          pip install --no-binary pycurl -r dev-requirements.txt -r helm-chart/images/binderhub/requirements.txt
           pip install -e .
+
+      - name: Install Playwright browser
+        run: playwright install firefox
 
       - name: Install JupyterHub chart for main tests
         if: matrix.test == 'main'
@@ -242,18 +245,23 @@ jobs:
       - name: "(Upgrade) Install ${{ matrix.upgrade-from }} chart"
         if: matrix.test-variation == 'upgrade'
         run: |
-          . ./ci/common
-          UPGRADE_FROM_VERSION=$(curl -sSL https://jupyterhub.github.io/helm-chart/info.json | jq -er '.binderhub.${{ matrix.upgrade-from }}')
+          # NOTE: We change the directory so binderhub the chart name won't be
+          #       misunderstood as the local folder name.
+          #
+          #       https://github.com/helm/helm/issues/9244
+          cd ci
+
+          if [ ${{ matrix.upgrade-from }} = stable ]; then
+            UPGRADE_FROM_VERSION=$(helm show chart --repo=https://hub.jupyter.org/helm-chart/ binderhub | yq e '.version' -)
+          elif [ ${{ matrix.upgrade-from }} = dev ]; then
+            UPGRADE_FROM_VERSION=$(helm show chart --devel --repo=https://hub.jupyter.org/helm-chart/ binderhub | yq e '.version' -)
+          else
+            UPGRADE_FROM_VERSION=${{ matrix.upgrade-from }}
+          fi
           echo "UPGRADE_FROM_VERSION=$UPGRADE_FROM_VERSION" >> $GITHUB_ENV
 
           echo ""
           echo "Installing already released binderhub version $UPGRADE_FROM_VERSION"
-
-          # FIXME: We change the directory so binderhub the chart name won't be
-          #        misunderstood as the local folder name.
-          #
-          #        https://github.com/helm/helm/issues/9244
-          cd ci
 
           old_config="../testing/k8s-binder-k8s-hub/binderhub-chart-config-old.yaml"
           if [ -f "$old_config" ]; then
@@ -289,10 +297,16 @@ jobs:
 
       - name: "(Upgrade) Await ${{ matrix.upgrade-from }} chart"
         if: matrix.test-variation == 'upgrade'
-        uses: jupyterhub/action-k8s-await-workloads@v2
+        uses: jupyterhub/action-k8s-await-workloads@v3
         with:
           timeout: 150
           max-restarts: 1
+
+      - name: Test the workaround for an incorrect docker.sock directory
+        if: matrix.test-variation == 'dind'
+        run: |
+          # {{ .Values.dind.hostSocketDir }}/{{ .Values.dind.hostSocketName }}
+          sudo mkdir -p /var/run/dind/docker.sock
 
       - name: Install the chart
         if: matrix.test == 'helm'
@@ -324,18 +338,18 @@ jobs:
       - name: Run main tests
         if: matrix.test == 'main'
         # running the "main" tests means "all tests that aren't auth"
-        run: pytest -m "not auth" --cov=binderhub
+        run: pytest -m "not auth" --cov=binderhub binderhub/tests/
 
       - name: Run auth tests
         if: matrix.test == 'auth'
         # running the "auth" tests means "all tests that are marked as auth"
-        run: pytest -m "auth" --cov=binderhub
+        run: pytest -m "auth" --cov=binderhub  binderhub/tests/
 
       - name: Run helm tests
         if: matrix.test == 'helm'
         run: |
           export BINDER_URL=http://localhost:30901
-          pytest --helm -m "remote" --cov=binderhub
+          pytest --helm -m "remote" --cov=binderhub binderhub/tests/
 
       - name: Get BinderHub health and metrics outputs
         if: always()
@@ -360,7 +374,7 @@ jobs:
             daemonset/binderhub-test-pink
 
       # GitHub action reference: https://github.com/codecov/codecov-action
-      - uses: codecov/codecov-action@v3
+      - uses: codecov/codecov-action@v5
 
   test-local:
     runs-on: ubuntu-22.04
@@ -383,24 +397,24 @@ jobs:
             libcurl4-openssl-dev \
             libssl-dev
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         id: setup-node
         with:
-          node-version: "18"
+          node-version: "22"
 
       - name: Cache npm
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.npm
           key: node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('**/package.json') }}-${{ github.job }}
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         id: setup-python
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Cache pip
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: python-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/*requirements.txt') }}-${{ github.job }}
@@ -415,10 +429,16 @@ jobs:
         #        binderhub/static/dist/bundle.js is built, and use "-e" to
         #        ensure code coverage is captured.
         #
+        # https://discourse.jupyter.org/t/suddenly-getting-oath-cert-error/24217/4
+        # pycurl wheels fail to pick up the system CA certs, so install from source
+        # until https://github.com/pycurl/pycurl/issues/834 resolves
         run: |
           pip install -r dev-requirements.txt -r testing/local-binder-local-hub/requirements.txt
-          pip install ".[pycurl]"
-          pip install -e ".[pycurl]"
+          pip install ".[pycurl]" --no-binary pycurl
+          pip install -e ".[pycurl]" --no-binary pycurl
+
+      - name: Install Playwright browser
+        run: playwright install firefox
 
       - name: Setup JupyterHub NPM dependencies
         run: npm install -g configurable-http-proxy
@@ -435,11 +455,11 @@ jobs:
       - name: Run remote tests
         run: |
           export BINDER_URL=http://localhost:8000/services/binder/
-          pytest -m remote --cov=binderhub
+          pytest -m remote --cov=binderhub binderhub/tests/
 
       - name: Show hub logs
         if: always()
         run: cat testing/local-binder-local-hub/jupyterhub.log
 
       # GitHub action reference: https://github.com/codecov/codecov-action
-      - uses: codecov/codecov-action@v3
+      - uses: codecov/codecov-action@v5

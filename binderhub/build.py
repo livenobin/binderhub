@@ -288,7 +288,7 @@ class KubernetesBuildExecutor(BuildExecutor):
         return os.getenv("BUILD_NAMESPACE", "default")
 
     build_image = Unicode(
-        "quay.io/jupyterhub/repo2docker:2023.06.0",
+        "quay.io/jupyterhub/repo2docker:2024.07.0",
         help="Docker image containing repo2docker that is used to spawn the build pods.",
         config=True,
     )
@@ -297,12 +297,19 @@ class KubernetesBuildExecutor(BuildExecutor):
     def _default_builder_info(self):
         return {"build_image": self.build_image}
 
+    image_pull_secrets = List(
+        [], help="Pull secrets for the builder image", config=True
+    )
+
     docker_host = Unicode(
         "/var/run/docker.sock",
+        allow_none=True,
         help=(
             "The docker socket to use for building the image. "
             "Must be a unix domain socket on a filesystem path accessible on the node "
-            "in which the build pod is running."
+            "in which the build pod is running. "
+            "This is mounted into the build pod, set to None to disable, "
+            "e.g. if you are using an alternative builder that doesn't need the docker socket."
         ),
         config=True,
     )
@@ -416,6 +423,54 @@ class KubernetesBuildExecutor(BuildExecutor):
 
         return affinity
 
+    def get_builder_volumes(self):
+        """
+        Get the lists of volumes and volume-mounts for the build pod.
+        """
+        volume_mounts = []
+        volumes = []
+
+        if self.docker_host is not None:
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    mount_path="/var/run/docker.sock", name="docker-socket"
+                )
+            )
+            docker_socket_path = urlparse(self.docker_host).path
+            volumes.append(
+                client.V1Volume(
+                    name="docker-socket",
+                    host_path=client.V1HostPathVolumeSource(
+                        path=docker_socket_path, type="Socket"
+                    ),
+                )
+            )
+
+        if not self.registry_credentials and self.push_secret:
+            volume_mounts.append(
+                client.V1VolumeMount(mount_path="/root/.docker", name="docker-config")
+            )
+            volumes.append(
+                client.V1Volume(
+                    name="docker-config",
+                    secret=client.V1SecretVolumeSource(secret_name=self.push_secret),
+                )
+            )
+
+        return volumes, volume_mounts
+
+    def get_image_pull_secrets(self):
+        """
+        Get the list of image pull secrets to be used for the builder image
+        """
+
+        image_pull_secrets = []
+
+        for secret in self.image_pull_secrets:
+            image_pull_secrets.append(client.V1LocalObjectReference(name=secret))
+
+        return image_pull_secrets
+
     def submit(self):
         """
         Submit a build pod to create the image for the repository.
@@ -423,20 +478,7 @@ class KubernetesBuildExecutor(BuildExecutor):
         Progress of the build can be monitored by listening for items in
         the Queue passed to the constructor as `q`.
         """
-        volume_mounts = [
-            client.V1VolumeMount(
-                mount_path="/var/run/docker.sock", name="docker-socket"
-            )
-        ]
-        docker_socket_path = urlparse(self.docker_host).path
-        volumes = [
-            client.V1Volume(
-                name="docker-socket",
-                host_path=client.V1HostPathVolumeSource(
-                    path=docker_socket_path, type="Socket"
-                ),
-            )
-        ]
+        volumes, volume_mounts = self.get_builder_volumes()
 
         env = [
             client.V1EnvVar(name=key, value=value)
@@ -452,16 +494,6 @@ class KubernetesBuildExecutor(BuildExecutor):
                 client.V1EnvVar(
                     name="CONTAINER_ENGINE_REGISTRY_CREDENTIALS",
                     value=json.dumps(self.registry_credentials),
-                )
-            )
-        elif self.push_secret:
-            volume_mounts.append(
-                client.V1VolumeMount(mount_path="/root/.docker", name="docker-config")
-            )
-            volumes.append(
-                client.V1Volume(
-                    name="docker-config",
-                    secret=client.V1SecretVolumeSource(secret_name=self.push_secret),
                 )
             )
 
@@ -510,6 +542,7 @@ class KubernetesBuildExecutor(BuildExecutor):
                 volumes=volumes,
                 restart_policy="Never",
                 affinity=self.get_affinity(),
+                image_pull_secrets=self.get_image_pull_secrets(),
             ),
         )
 
