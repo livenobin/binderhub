@@ -39,6 +39,7 @@ required:
   - extraVolumes
   - extraVolumeMounts
   - extraEnv
+  - extraPodSpec
   - podAnnotations
   - global
 properties:
@@ -416,16 +417,20 @@ properties:
       storageDriver:
         type: string
         description: |
-          TODO
+          Docker storage driver
       resources: *resources-spec
-      hostSocketDir:
+      hostSocketDir: &hostSocketDir-spec
         type: string
         description: |
-          TODO
-      hostLibDir:
+          Host directory where the container socket will be located
+      hostLibDir: &hostStorageDir-spec
         type: string
         description: |
-          TODO
+          Host directory where the containers storage will be located
+      hostSocketName: &hostSocketName-spec
+        type: string
+        description: |
+          Name of the container socket file
 
   pink:
     type: object
@@ -445,25 +450,26 @@ properties:
           extraVolumes: *extraVolumes-spec
           extraVolumeMounts: *extraVolumeMounts-spec
       resources: *resources-spec
-      hostStorageDir:
-        type: string
-        description: |
-          Host path where the containers storage will be located
-      hostSocketDir:
-        type: string
-        description: |
-          Host path where the podman socket will be located
+      hostStorageDir: *hostStorageDir-spec
+      hostSocketDir: *hostSocketDir-spec
+      hostSocketName: *hostSocketName-spec
 
   imageCleaner:
     type: object
     additionalProperties: false
-    required: [enabled]
+    required:
+      - enabled
     properties:
       enabled:
         type: boolean
         description: |
           TODO
       image: *image-spec
+      cordon:
+        type: boolean
+        description: |
+          Whether to cordon the node while cleaning its images.
+          Disable, e.g. for single-node clusters.
       delay:
         type: integer
         description: |
@@ -480,6 +486,12 @@ properties:
         type: integer
         description: |
           TODO
+      extraEnv:
+        type: [object, array]
+        additionalProperties: true
+        description: |
+          see binderhub.deployment.extraEnv
+
       host:
         type: object
         additionalProperties: false
@@ -604,6 +616,21 @@ properties:
 
       For more information, see the [Kubernetes EnvVar
       specification](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.19/#envvar-v1-core).
+  extraPodSpec:
+    type: object
+    additionalProperties: true
+    description: |
+      Arbitrary extra k8s pod specification for the binder pod, as a YAML object.
+
+      Use this to set extra pod fields that aren't supported by the Helm chart, e.g.
+
+      ```yaml
+      extraPodSpec:
+        priorityClassName: my-priority-class
+      ```
+
+      See [PodSpec](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec)
+
   podAnnotations:
     type: object
     additionalProperties: false
